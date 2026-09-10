@@ -1,0 +1,89 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: supervisor
+      POSTGRES_PASSWORD: supervisor
+      POSTGRES_DB: order_supervisor
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U supervisor -d order_supervisor"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Temporal dev server: gRPC on 7233, web UI on 8233.
+  # Single container with its own embedded database — right size for a POC.
+  temporal:
+    image: temporalio/temporal:latest
+    command:
+      - server
+      - start-dev
+      - --ip
+      - 0.0.0.0
+      - --port
+      - "7233"
+      - --ui-port
+      - "8233"
+      - --db-filename
+      - /home/temporal/temporal.db
+    ports:
+      - "7233:7233"
+      - "8233:8233"
+    volumes:
+      - temporaldata:/home/temporal
+
+  api:
+    build: ./backend
+    profiles: ["full"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql+asyncpg://supervisor:supervisor@postgres:5432/order_supervisor
+      TEMPORAL_HOST: temporal:7233
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      LLM_MODE: ${LLM_MODE:-auto}
+      CORS_ORIGINS: http://localhost:3000
+    ports:
+      - "8000:8000"
+    command: >
+      sh -c "alembic upgrade head &&
+             python -m app.seed &&
+             uvicorn main:app --host 0.0.0.0 --port 8000"
+
+  worker:
+    build: ./backend
+    profiles: ["full"]
+    depends_on:
+      api:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql+asyncpg://supervisor:supervisor@postgres:5432/order_supervisor
+      TEMPORAL_HOST: temporal:7233
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      LLM_MODE: ${LLM_MODE:-auto}
+    command: python -m app.worker
+
+  web:
+    build: ./frontend
+    profiles: ["full"]
+    depends_on:
+      - api
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+
+volumes:
+  pgdata:
+  temporaldata:
